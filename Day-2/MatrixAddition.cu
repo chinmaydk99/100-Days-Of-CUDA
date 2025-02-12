@@ -43,6 +43,7 @@ int main()
     dim3 gridDim(ceil(N/16.0f), ceil(N/16.0f)); // Be careful about integer division here
     
     matAddKernel<<<gridDim,blockDim>>>(A_d,B_d,C_d,N);
+    cudaDeviceSynchronize();
 
     cudaMemcpy(C, C_d, N*N*sizeof(float), cudaMemcpyDeviceToHost);
 
