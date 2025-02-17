@@ -5,6 +5,7 @@
 
 using namespace std;
 
+// Matrix multiplication Calculation
 void matMul(const vector<float> &A, const vector <float> &B, vector <float> &C, int M, int K, int N)
 {
     for(int i = 0; i < M; i++){
