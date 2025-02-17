@@ -47,8 +47,7 @@ __global__ void multiHeadAttention(
     __syncthreads();
 
     // Step 2: Computing the dot product between Q and K tranpose
-    if(threadId < seq_len){
-        
+    if(threadId < seq_len){ 
     }
 
 }
