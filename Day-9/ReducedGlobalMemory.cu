@@ -1,21 +1,25 @@
-#include <stdio.h>
+#include <iostream>
 #include <cuda_runtime.h>
 
 #define N 1024  
-#define THREADS_PER_BLOCK (N )
+#define THREADS_PER_BLOCK (N/2)
 
-__global__ void SimpleSumReductionKernel(float *input, float *output){
-    
+__global__ void SumKernelReducedGM(float *input, float *output){
+    __shared__ float input_ds[THREADS_PER_BLOCK];
     unsigned int i = threadIdx.x;
+    unsigned int globalIdx = i + blockDim.x;
 
-    for(int stride = blockDim.x / 2; stride >= 1; stride /= 2){
-        if(threadIdx.x < stride){
-            input[i] += input[i+stride];
-        }
+    input_ds[i] = input[i] + ((globalIdx < N)?input[globalIdx]:0.0f); // Coalescing 
+
+    for(unsigned int stride = blockDim.x/2; stride >=1 ; stride /= 2){
         __syncthreads();
+        if(i < stride){
+            input_ds[i] += input_ds[i + stride];
+        }     
     }
-    if(threadIdx.x == 0){
-        *output = input[0];
+
+    if(i == 0){
+        *output = input_ds[0];
     }
 }
 
@@ -32,7 +36,7 @@ int main() {
 
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
 
-    SimpleSumReductionKernel<<<1, THREADS_PER_BLOCK>>>(d_input, d_output);
+    SumKernelReducedGM<<<1, THREADS_PER_BLOCK>>>(d_input, d_output);
 
     cudaMemcpy(&h_output, d_output, sizeof(float), cudaMemcpyDeviceToHost);
 
