@@ -27,8 +27,8 @@ __global__ void unrollKernel(int C, int H, int W, int K, const float* X, float* 
         int c = t / W_unroll;
         int w_unroll = t % W_unroll; // Column Index of unrolled matrix for output position
 
-        int h_out = w_unroll / W_out;
-        int w_out = w_unroll % W_out;
+        int h_out = w_unroll / W_out; // Row position in output feature map
+        int w_out = w_unroll % W_out; // Column position in output feature map
 
         int w_base = c * K * K; // channel offset. So in the matrix, first K*K will be channel 0, next K*K will be channel 1 and so on
 
@@ -44,6 +44,7 @@ __global__ void unrollKernel(int C, int H, int W, int K, const float* X, float* 
 ///////////////////////////////////////
 // Tiled GEMM Kernel (with Shared Memory)
 ///////////////////////////////////////
+
 __global__ void tiledGEMMKernel(int M, int N, int K, const float* A, const float* B, float* C) {
     __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
     __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
