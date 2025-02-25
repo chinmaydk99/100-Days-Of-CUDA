@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-void matrix_multiplication(){
+void matrix_vector_multiplication(){
     cublasHandle_t handle;
     cublasCreate(&handle);
 
@@ -42,4 +42,9 @@ void matrix_multiplication(){
     cudaFree(d_x);
     cudaFree(d_y);
     cublasDestroy(handle);
+}
+
+int main(){
+    matrix_vector_multiplication();
+    return 0;
 }

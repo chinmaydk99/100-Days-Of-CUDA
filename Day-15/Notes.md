@@ -1,4 +1,3 @@
-Stochastic Gradient Descent
-![](image.png)
-
+Ridge Regression
+![](image-1.png)
 
