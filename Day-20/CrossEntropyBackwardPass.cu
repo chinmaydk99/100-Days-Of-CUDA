@@ -4,6 +4,35 @@
 
 #define THREADS_PER_BLOCK 32
 
+__global__ void BackwardPass_Kernel(
+    const float* __restrict__ logits, //nrows, vocab_size
+    const int* __restrict__ labels, //nrows,
+    const float* __restrict__ logsumexp, // nrows,
+    float* __restrict__ dlogits, //nrows, vocab_size
+    int nrows, 
+    int vocab_size
+){
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const float* row_logits = logits + row*vocab_size;
+    float* row_dlogits = dlogits + row*vocab_size;
+
+    float logsumexpval = logsumexp[row];
+
+    // Computing the softmax
+    for(int i = tid; i < vocab_size; i += blockDim.x){
+        row_dlogits[i] = expf(row_logits[i] - logsumexpval); // p_i = exp(x_i - logsumexp)
+    }
+
+    if(tid == 0){
+        int label = labels[row];
+        if(label >= 0){
+            row_dlogits[label] -= 1.0f;
+        }
+    }
+}
+
 void compute_cross_entropy_backward(float *h_logits, int *h_labels, float *h_logsumexp, float *h_dlogits, int n_rows, int vocab_size){
     float *d_logits, *d_dlogits, *d_logsumexp;
     int *d_labels;
@@ -17,9 +46,7 @@ void compute_cross_entropy_backward(float *h_logits, int *h_labels, float *h_log
     cudaMemcpy(d_labels, h_labels, n_rows * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_logsumexp, h_logsumexp, n_rows * sizeof(float), cudaMemcpyHostToDevice);
     
-    int shared_memory_size = THREADS_PER_BLOCK * sizeof(float);
-
-    CrossEntropy_Backward_Kernel<<<n_rows, THREADS_PER_BLOCK, shared_memory_size>>>(
+    BackwardPass_Kernel<<<n_rows, THREADS_PER_BLOCK>>>(
         d_logits, d_labels, d_dlogits, d_logsumexp, n_rows, vocab_size);
     cudaDeviceSynchronize();
 
