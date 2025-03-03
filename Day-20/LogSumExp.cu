@@ -30,14 +30,13 @@ __global__ void LogSumExp_Kernel(
     shared_data[tid] = local_max;
     __syncthreads();
 
-    float max_val = 0.0f;
     for(int stride = blockDim.x / 2; stride > 0; stride /= 2){
         if(tid < stride){
             shared_data[tid] = fmaxf(shared_data[tid], shared_data[tid+stride]);
         }
         __syncthreads();
     }
-    max_val = shared_data[0]; // Final Max Value of the row after reduction
+    float max_val = shared_data[0]; // Final Max Value of the row after reduction
 
     // Computing Sum of Exp(Logits - Max)
     float sum_exp = 0.0f;
