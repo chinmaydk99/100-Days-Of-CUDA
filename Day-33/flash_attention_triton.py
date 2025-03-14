@@ -190,54 +190,138 @@ def flash_attn_v2_backward_preprocess(
 
     tl.store(d_ptr + d_offset + row_indices, d_block, mask=row_mask)
 
-# Grid Dimension = (batch_size, num_heads, triton.cdiv(seq_len, block_size))
 @triton.jit
-def flash_attn_v2_backward_preprocess(
-    o_ptr, do_ptr, d_ptr,
+def flash_attn_v2_backward_dq(
+    q_ptr, k_ptr, v_ptr, o_ptr, do_ptr, dq_ptr,
+    m_ptr, l_ptr, d_ptr,
     batch_size, seq_len, num_heads, head_dim,
+    q_batch_stride, q_head_stride, q_seq_stride, q_head_dim_stride,
+    k_batch_stride, k_head_stride, k_seq_stride, k_head_dim_stride,
+    v_batch_stride, v_head_stride, v_seq_stride, v_head_dim_stride,
     o_batch_stride, o_head_stride, o_seq_stride, o_head_dim_stride,
     do_batch_stride, do_head_stride, do_seq_stride, do_head_dim_stride,
-    BLOCK_SIZE: tl.constexpr
+    dq_batch_stride, dq_head_stride, dq_seq_stride, dq_head_dim_stride,
+    scale,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     """
-    Preprocess for backward pass: Compute D = rowsum(O * dO)
+    Compute dQ for Flash Attention V2 backward pass
     """
     batch_id = tl.program_id(0)
     head_id = tl.program_id(1)
-    block_id = tl.program_id(2)
+    m_id = tl.program_id(2)
 
-    start_idx = block_id * BLOCK_SIZE
-    row_indices = start_idx + tl.arange(0, BLOCK_SIZE)
+    # Starting row index
+    start_m = m_id * BLOCK_SIZE_M
+    row_indices = start_m + tl.arange(0, BLOCK_SIZE_M)
     row_mask = row_indices < seq_len
 
-    o_batch_offset = batch_id * o_batch_stride
-    o_head_offset = head_id * o_head_stride
-
+    q_batch_offset = batch_id * q_batch_stride
+    q_head_offset = head_id * q_head_stride
+    k_batch_offset = batch_id * k_batch_stride
+    k_head_offset = head_id * k_head_stride
+    v_batch_offset = batch_id * v_batch_stride
+    v_head_offset = head_id * v_head_stride
     do_batch_offset = batch_id * do_batch_stride
     do_head_offset = head_id * do_head_stride
+    dq_batch_offset = batch_id * dq_batch_stride
+    dq_head_offset = head_id * dq_head_stride
 
-    # Load in the O block and dO block
-    o_block = tl.load(
-        o_ptr + o_batch_offset + o_head_offset +
-        row_indices[:, None] * o_seq_stride +
-        tl.arange(0, head_dim)[None, :] * o_head_dim_stride,
-        mask=row_mask[:, None] & (tl.arange(0, head_dim)[None, :] < head_dim),
+    # Get the m, l, and d values for these rows
+    m_offset = batch_id * (num_heads * seq_len) + head_id * seq_len
+    m_i = tl.load(
+        m_ptr + m_offset + row_indices,
+        mask=row_mask,
+        other=float("-inf")
+    )
+    l_i = tl.load(
+        l_ptr + m_offset + row_indices,
+        mask=row_mask,
+        other=0.0
+    )
+    d_i = tl.load(
+        d_ptr + m_offset + row_indices,
+        mask=row_mask,
         other=0.0
     )
 
+    # Load Q block for this set of queries
+    q_block = tl.load(
+        q_ptr + q_batch_offset + q_head_offset +
+        row_indices[:, None] * q_seq_stride +
+        tl.arange(0, BLOCK_SIZE_K)[None, :] * q_head_dim_stride,
+        mask=row_mask[:, None] & (tl.arange(0, BLOCK_SIZE_K)[None, :] < head_dim),
+        other=0.0
+    )
+
+    # Load dO block for this set of queries
     do_block = tl.load(
         do_ptr + do_batch_offset + do_head_offset +
         row_indices[:, None] * do_seq_stride +
-        tl.arange(0, head_dim)[None, :] * do_head_dim_stride,
-        mask=row_mask[:, None] & (tl.arange(0, head_dim)[None, :] < head_dim),
+        tl.arange(0, BLOCK_SIZE_K)[None, :] * do_head_dim_stride,
+        mask=row_mask[:, None] & (tl.arange(0, BLOCK_SIZE_K)[None, :] < head_dim),
         other=0.0
     )
 
-    d_block = tl.sum(o_block * do_block, axis=1)
+    # Initialize dQ accumulator
+    dq_block = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_K], dtype=tl.float32)
 
-    d_offset = batch_id * (num_heads * seq_len) + head_id * seq_len
+    # Process KV blocks
+    for start_n in range(0, seq_len, BLOCK_SIZE_N):
+        col_indices = start_n + tl.arange(0, BLOCK_SIZE_N)
+        col_mask = col_indices < seq_len
 
-    tl.store(d_ptr + d_offset + row_indices, d_block, mask=row_mask)
+        if IS_CAUSAL:
+            causal_mask = row_indices[:, None] >= col_indices[None, :]
+
+        # Load K block
+        k_block = tl.load(
+            k_ptr + k_batch_offset + k_head_offset +
+            col_indices[:, None] * k_seq_stride +
+            tl.arange(0, BLOCK_SIZE_K)[None, :] * k_head_dim_stride,
+            mask=col_mask[:, None] & (tl.arange(0, BLOCK_SIZE_K)[None, :] < head_dim),
+            other=0.0
+        )
+
+        # Load V block
+        v_block = tl.load(
+            v_ptr + v_batch_offset + v_head_offset +
+            col_indices[:, None] * v_seq_stride +
+            tl.arange(0, BLOCK_SIZE_K)[None, :] * v_head_dim_stride,
+            mask=col_mask[:, None] & (tl.arange(0, BLOCK_SIZE_K)[None, :] < head_dim),
+            other=0.0
+        )
+
+        # Compute attention scores
+        scores = tl.dot(q_block, tl.trans(k_block)) * scale
+
+        if IS_CAUSAL:
+            scores = tl.where(causal_mask, scores, float('-inf'))
+
+        # Compute P = softmax(QK^T)
+        p = tl.exp(scores - m_i[:, None])
+
+        # Compute dV component
+        dv = tl.dot(p, do_block)
+
+        # Compute dp = dO @ V^T
+        dp = tl.dot(do_block, tl.trans(v_block))
+
+        # Compute dS = P * (dp - d_i)
+        ds = p * (dp - d_i[:, None])
+
+        # Update dQ accumulator
+        dq_block += tl.dot(ds, k_block) * scale
+
+    # Store dQ block
+    tl.store(
+        dq_ptr + dq_batch_offset + dq_head_offset +
+        row_indices[:, None] * dq_seq_stride +
+        tl.arange(0, BLOCK_SIZE_K)[None, :] * dq_head_dim_stride,
+        dq_block,
+        mask=row_mask[:, None] & (tl.arange(0, BLOCK_SIZE_K)[None, :] < head_dim)
+    )
 
 @triton.jit
 def flash_attn_v2_backward_dkv(
