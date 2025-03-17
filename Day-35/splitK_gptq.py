@@ -60,11 +60,11 @@ def splitk_gptq_kernel(
     b_ptrs = b_ptr + (offsets_k[:, None] // 8) * stride_bk + offsets_bn[None, :] * stride_bn
     
     # Compute pointers to scales and zeros
-    scales_ptrs = scales_ptr + offsets_n * stride_scales_n
-    zeros_ptrs = zeros_ptr + (offsets_n // 8) * stride_zeros_n
+    scales_ptrs = scales_ptr + offsets_n * stride_scales_n # One scaling value per column in B
+    zeros_ptrs = zeros_ptr + (offsets_n // 8) * stride_zeros_n # Same but unlike scales, these are 4-bit quantized 
     
     # Compute bit shifters for 4-bit values
-    shifter = (offsets_k % 8) * 4
+    shifter = (offsets_k % 8) * 4 # For 8 bit quantisation, this would be (offsets_k % 4) * 8
     zeros_shifter = (offsets_n % 8) * 4
     
     # Initialize accumulator
@@ -93,17 +93,13 @@ def splitk_gptq_kernel(
         b = (b_quant >> shifter[:, None]) & 0xF
         b = b * scales[None, :] - zeros[None, :]
         
-        # Compute dot product and accumulate
         acc += tl.dot(a, b)
         
-        # Move pointers for next iteration
         a_ptrs += BLOCK_SIZE_K * SPLIT_K * stride_ak
         b_ptrs += (BLOCK_SIZE_K // 8) * SPLIT_K * stride_bk
     
-    # Convert accumulator to float16 (if needed)
     acc = acc.to(tl.float16)
     
-    # Calculate output pointers
     c_ptrs = c_ptr + offsets_m[:, None] * stride_cm + offsets_n[None, :] * stride_cn
     
     # Atomic add for split-K reduction
