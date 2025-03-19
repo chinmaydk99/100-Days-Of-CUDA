@@ -7,6 +7,7 @@ from logging import getLogger
 import tqdm
 from transformers.models.llama.modeling_llama import LlamaMLP
 import math
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     import triton
@@ -156,9 +157,9 @@ def quant_fused_matmul_kernel(
 class FusedLlamaMLPQuantized(FusedBaseModule):
     def __init__(self, gate_proj, down_proj, up_proj):
         super().__init__()
-        self.infeatures = gate_proj.in_features
-        self.outfeatures = gate_proj.out_features
-        self.intermediate_size = gate_proj.intermediate_size
+        self.infeatures = gate_proj.infeatures
+        self.intermediate_size = gate_proj.outfeatures
+        self.outfeatures = down_proj.outfeatures
         self.bits = gate_proj.bits
         self.maxq = gate_proj.maxq
 
