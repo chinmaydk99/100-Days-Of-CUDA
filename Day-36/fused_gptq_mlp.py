@@ -161,18 +161,7 @@ def fused_gptq_mlp_kernel(
         n_start = n_idx * BLOCK_SIZE_N
         offs_n_curr = n_start + offs_n
 
-        # inter_block = intermediate[:, n_start : n_start + BLOCK_SIZE_N]
-        # inter_block = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-        # for i in range(BLOCK_SIZE_N):
-        #     if n_start + i < N:
-        #         inter_block[:, i] = intermediate[:, n_start + i]
-        
-        inter_block = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-
-        for m in range(BLOCK_SIZE_M):
-            for n in range(BLOCK_SIZE_N):
-                if n_start + n < N:
-                    inter_block[m, n] = intermediate[m, n_start + n]
+        inter_block = intermediate[:, n_start : n_start + BLOCK_SIZE_N]
 
         g_id = n_start // groupsize
 
