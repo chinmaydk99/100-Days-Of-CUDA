@@ -1,3 +1,4 @@
+// Resource: https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/
 #include <iostream>
 #include <cuda_runtime.h>
 #include <assert.h>
