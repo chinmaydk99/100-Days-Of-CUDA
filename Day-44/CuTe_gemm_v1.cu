@@ -1,5 +1,17 @@
 #include <iostream>
 #include <cuda_runtime.h>
+#include <cstdlib>
+#include <cstdio>
+#include <cassert>
+
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+
+#include <cute/tensor.hpp>
+
+#include "cutlass/util/print_error.hpp"
+#include "cutlass/util/GPU_Clock.hpp"
+#include "cutlass/util/helper_cuda.hpp"
 
 
 template <class ProblemShape, // {M, N, K}
@@ -20,7 +32,7 @@ gemm_device(ProblemShape shape_MNK,
             Alpha alpha, Beta beta)
 {
     using namespace cute;
-    CUTE_STATIC_ASSERT_V(rank(shape_MNK) == INT<3>{}); / {M,N,K}
+    CUTE_STATIC_ASSERT_V(rank(shape_MNK) == INT<3>{}); // {M,N,K}
 
     CUTE_STATIC_ASSERT_V(congruent(select<0,2>(shape_MNK), dA)); // {M, K}
     CUTE_STATIC_ASSERT_V(congruent(select<1,2>(shape_MNK), dB)); //{N,K} and not {K,N} as per BLAS convention
@@ -161,4 +173,102 @@ void gemma_nt(int m, int n, int k,
         B, dB, sB, tB,
         C, dC, sC, tC,
         alpha, beta);
+}
+
+int main(int argc, char** argv)
+{
+  int m = 5120;
+  if (argc >= 2)
+    sscanf(argv[1], "%d", &m);
+
+  int n = 5120;
+  if (argc >= 3)
+    sscanf(argv[2], "%d", &n);
+
+  int k = 4096;
+  if (argc >= 4)
+    sscanf(argv[3], "%d", &k);
+
+  char transA = 'N';
+  if (argc >= 5)
+    sscanf(argv[4], "%c", &transA);
+
+  char transB = 'T';
+  if (argc >= 6)
+    sscanf(argv[5], "%c", &transB);
+
+  using TA = float;
+  using TB = float;
+  using TC = float;
+  using TI = float;
+
+  TI alpha = 1.0;
+  TI beta  = 0.0;
+
+  std::cout << "M = " << m << std::endl;
+  std::cout << "N = " << n << std::endl;
+  std::cout << "K = " << k << std::endl;
+  std::cout << "C = A^" << transA << " B^" << transB << std::endl;
+
+  cute::device_init(0);
+
+  thrust::host_vector<TA> h_A(m*k);
+  thrust::host_vector<TB> h_B(n*k);
+  thrust::host_vector<TC> h_C(m*n);
+
+  for (int j = 0; j < m*k; ++j) h_A[j] = static_cast<TA>( 2*(rand() / double(RAND_MAX)) - 1 );
+  for (int j = 0; j < n*k; ++j) h_B[j] = static_cast<TB>( 2*(rand() / double(RAND_MAX)) - 1 );
+  for (int j = 0; j < m*n; ++j) h_C[j] = static_cast<TC>(-1);
+
+  thrust::device_vector<TA> d_A = h_A;
+  thrust::device_vector<TB> d_B = h_B;
+  thrust::device_vector<TC> d_C = h_C;
+
+  double gflops = (2.0*m*n*k) * 1e-9;
+
+  const int timing_iterations = 100;
+  GPU_Clock timer;
+
+  int ldA = 0, ldB = 0, ldC = m;
+
+  if (transA == 'N') {
+    ldA = m;
+  } else if (transA == 'T') {
+    ldA = k;
+  } else {
+    assert(false);
+  }
+
+  if (transB == 'N') {
+    ldB = k;
+  } else if (transB == 'T') {
+    ldB = n;
+  } else {
+    assert(false);
+  }
+  // Run once
+  d_C = h_C;
+  gemm(transA, transB, m, n, k,
+       alpha,
+       d_A.data().get(), ldA,
+       d_B.data().get(), ldB,
+       beta,
+       d_C.data().get(), ldC);
+  CUTE_CHECK_LAST();
+  thrust::host_vector<TC> cute_result = d_C;
+
+  // Timing iterations
+  timer.start();
+  for (int i = 0; i < timing_iterations; ++i) {
+    gemm(transA, transB, m, n, k,
+         alpha,
+         d_A.data().get(), ldA,
+         d_B.data().get(), ldB,
+         beta,
+         d_C.data().get(), ldC);
+  }
+  double cute_time = timer.seconds() / timing_iterations;
+  CUTE_CHECK_LAST();
+  printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+  return 0;
 }
