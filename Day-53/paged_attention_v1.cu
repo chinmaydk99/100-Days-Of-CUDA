@@ -1,4 +1,3 @@
-%%writefile standalone_paged_attention_v1.cu
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
