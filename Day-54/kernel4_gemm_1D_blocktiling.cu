@@ -17,69 +17,65 @@
 } while(0)
 
 // Fixing row within each warp while the column changes. This ensures contiguous data access in row major layout
-<template const int BM, const int BN, const int BK, const int TM>
+template <const int BM, const int BN, const int BK, const int TM>
 __global__ void gemm_1d_blocktiling(const float *A, const float *B, float *C, int M, int N, int K, float alpha, float beta){
-    const uint cRow = blockIdx.y;
-  const uint cCol = blockIdx.x;
+    unsigned int cRow = blockIdx.y;
+    unsigned int cCol = blockIdx.x; // The reference material i saw mentioned that this swap was purely based on observed performance
 
-  // each warp will calculate 32*TM elements, with 32 being the columnar dim.
-  const int threadCol = threadIdx.x % BN;
-  const int threadRow = threadIdx.x / BN;
+    // Initialise shared memory
+    __shared__ float A_shared[BM*BK];
+    __shared__ float B_shared[BK*BN];
 
-  // allocate space for the current blocktile in SMEM
-  __shared__ float As[BM * BK];
-  __shared__ float Bs[BK * BN];
+    // Calculate row and column within the tile
+    int tileRow = threadIdx.x / BN;
+    int tileCol = threadIdx.x % BN;
 
-  // Move blocktile to beginning of A's row and B's column
-  A += cRow * BM * K;
-  B += cCol * BN;
-  C += cRow * BM * N + cCol * BN;
+    // Find rows and cols in A and B that are being referenced
+    int inner_rowA = threadIdx.x / BK;
+    int inner_colA = threadIdx.x % BK;
+    int inner_rowB = threadIdx.x / BN;
+    int inner_colB = threadIdx.x % BN;
 
-  // todo: adjust this to each thread to load multiple entries and
-  // better exploit the cache sizes
-  assert(BM * BK == blockDim.x);
-  assert(BN * BK == blockDim.x);
-  const uint innerColA = threadIdx.x % BK; // warp-level GMEM coalescing
-  const uint innerRowA = threadIdx.x / BK;
-  const uint innerColB = threadIdx.x % BN; // warp-level GMEM coalescing
-  const uint innerRowB = threadIdx.x / BN;
+    // Moving A, B and C to beginning of this tile
+    A += (cRow * BM) * K; // A[0][0] -> A[cRow][0]
+    B += cCol * BN; // B[0][0] -> A[0][cCol]
+    C += (cRow * BM) * N + (cCol * BN); // C[0][0] -> C[cRow][cCol]
 
-  // allocate thread-local cache for results in registerfile
-  float threadResults[TM] = {0.0};
+    // Thread local cache for results in register
+    float threadResults[TM] = {0.0f};
 
-  // outer loop over block tiles
-  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
-    // populate the SMEM caches
-    As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
-    Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
-    __syncthreads();
+    // Iterating through blocks in K dimension
+    for(int k_blck_idx = 0; k_blck_idx < K; k_blck_idx += BK){
+        // GMEM -> SMEM
+        A_shared[inner_rowA * BK + inner_colA] = A[inner_rowA * K + inner_colA];
+        B_shared[inner_rowB * BN + inner_colB] = B[inner_rowB * N + inner_colB];
+        __syncthreads();
 
-    // advance blocktile
-    A += BK;
-    B += BK * N;
+        // Move A and B along the K dimension by BK
+        A += BK; 
+        B += BK * N;
 
-    // calculate per-thread results
-    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
-      // we make the dotproduct loop the outside loop, which facilitates
-      // reuse of the Bs entry, which we can cache in a tmp var.
-      float tmpB = Bs[dotIdx * BN + threadCol];
-      for (uint resIdx = 0; resIdx < TM; ++resIdx) {
-        threadResults[resIdx] +=
-            As[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
-      }
+        // Inner looping iterating through K indices for the A and B blocks
+        for(int kIdx = 0; kIdx < BK; ++kIdx){
+            // Load corresponding B element into register
+            float B_reg = B_shared[kIdx * BN + tileCol];
+
+            // Iterating through the TM results assigned to the current thread
+            for(int resIdx = 0; resIdx < TM; ++resIdx){
+                int baseRow = tileRow * TM;
+                int specificRow = baseRow + resIdx;
+
+                threadResults[resIdx] += A[specificRow * BK + kIdx] * B_reg; 
+            }
+
+            __syncthreads();
+        }
     }
-    __syncthreads();
-  }
 
-  // write out the results
-  for (uint resIdx = 0; resIdx < TM; ++resIdx) {
-    C[(threadRow * TM + resIdx) * N + threadCol] =
-        alpha * threadResults[resIdx] +
-        beta * C[(threadRow * TM + resIdx) * N + threadCol];
-  }
+    for(int resIdx = 0; resIdx < TM; ++resIdx){
+        C[(tileRow * TM + resIdx)* BK + tileCol] = alpha * threadResults[resIdx] + beta * C[(tileRow * TM + resIdx) * BK + tileCol];
+    }
 }
-
-
 
 void initialise_matrix(float * mat, int rows, int cols){
     std::random_device rd;
@@ -116,6 +112,12 @@ int main(){
     size_t size_A = M * K * sizeof(float);
     size_t size_B = K * N * sizeof(float);
     size_t size_C = M * N * sizeof(float);
+
+    // Block parameters
+    const int BM = 64;
+    const int BN = 64;
+    const int BK = 8;
+    const int TM = 2;
 
     float *h_A = new float[M*K];
     float *h_B = new float[K*N];
@@ -174,7 +176,7 @@ int main(){
     CUDA_CHECK(cudaEventRecord(start, 0));
 
     // Kernel Launch
-    gemm_sharedmemory<<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
+    gemm_1d_blocktiling<BM, BN, BK, TM><<<gridSize, blockSize>>>(d_A, d_B, d_C, M, N, K, alpha, beta);
     CUDA_CHECK(cudaGetLastError());
 
     // Record stop event
