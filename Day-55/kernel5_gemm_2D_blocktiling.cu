@@ -16,77 +16,98 @@
     } \
 } while(0)
 
-// Fixing row within each warp while the column changes. This ensures contiguous data access in row major layout
-template <const int BM, const int BN, const int BK, const int TM>
-__global__ void gemm_1d_blocktiling(const float *A, const float *B, float *C, int M, int N, int K, float alpha, float beta){
-    unsigned int cRow = blockIdx.y;
-    unsigned int cCol = blockIdx.x; // The reference material i saw mentioned that this swap was purely based on observed performance
+template <const int BM, const int BN, const int BK, const int TM, const int TN>
+__global__ void __launch_bounds__((BM * BN) / (TM * TN), 1)
+    sgemm2DBlocktiling(int M, int N, int K, float alpha, const float *A,
+                       const float *B, float beta, float *C) {
+  const uint cRow = blockIdx.y;
+  const uint cCol = blockIdx.x;
 
-    // Initialise shared memory
-    __shared__ float A_shared[BM*BK];
-    __shared__ float B_shared[BK*BN];
+  const uint totalResultsBlocktile = BM * BN;
+  // A thread is responsible for calculating TM*TN elements in the blocktile
+  const uint numThreadsBlocktile = totalResultsBlocktile / (TM * TN);
 
-    // Calculate row and column within the tile
-    int tileRow = threadIdx.x / BN;
-    int tileCol = threadIdx.x % BN;
+  // ResultsPerBlock / ResultsPerThread == ThreadsPerBlock
+  assert(numThreadsBlocktile == blockDim.x);
 
-    // Find rows and cols in A and B that are being referenced
-    int inner_rowA = threadIdx.x / BK;
-    int inner_colA = threadIdx.x % BK;
-    int inner_rowB = threadIdx.x / BN;
-    int inner_colB = threadIdx.x % BN;
+  // BN/TN are the number of threads to span a column
+  const int threadCol = threadIdx.x % (BN / TN);
+  const int threadRow = threadIdx.x / (BN / TN);
 
-    // Moving A, B and C to beginning of this tile
-    A += (cRow * BM) * K; // A[0][0] -> A[cRow][0]
-    B += cCol * BN; // B[0][0] -> A[0][cCol]
-    C += (cRow * BM) * N + (cCol * BN); // C[0][0] -> C[cRow][cCol]
+  // allocate space for the current blocktile in smem
+  __shared__ float As[BM * BK];
+  __shared__ float Bs[BK * BN];
 
-    // Thread local cache for results in register
-    float threadResults[TM] = {0.0f};
+  // Move blocktile to beginning of A's row and B's column
+  A += cRow * BM * K;
+  B += cCol * BN;
+  C += cRow * BM * N + cCol * BN;
 
-    // Iterating through blocks in K dimension
-    for(int k_blck_idx = 0; k_blck_idx < K; k_blck_idx += BK){
-        // GMEM -> SMEM
-        if(inner_rowA < M && inner_colA < K){
-            A_shared[inner_rowA * BK + inner_colA] = A[inner_rowA * K + inner_colA];
-        }
-        
-        if(inner_rowB < K && inner_colB < N){
-            B_shared[inner_rowB * BN + inner_colB] = B[inner_rowB * N + inner_colB];
-        }
-        __syncthreads();
+  // calculating the indices that this thread will load into SMEM
+  const uint innerRowA = threadIdx.x / BK;
+  const uint innerColA = threadIdx.x % BK;
+  // calculates the number of rows of As that are being loaded in a single step
+  // by a single block
+  const uint strideA = numThreadsBlocktile / BK;
+  const uint innerRowB = threadIdx.x / BN;
+  const uint innerColB = threadIdx.x % BN;
+  // for both As and Bs we want each load to span the full column-width, for
+  // better GMEM coalescing (as opposed to spanning full row-width and iterating
+  // across columns)
+  const uint strideB = numThreadsBlocktile / BN;
 
-        // Move A and B along the K dimension by BK
-        A += BK; 
-        B += BK * N;
+  // allocate thread-local cache for results in registerfile
+  float threadResults[TM * TN] = {0.0};
+  // register caches for As and Bs
+  float regM[TM] = {0.0};
+  float regN[TN] = {0.0};
 
-        // Inner looping iterating through K indices for the A and B blocks
-        for(int kIdx = 0; kIdx < BK; ++kIdx){
-            // Load corresponding B element into register
-            float B_reg = B_shared[kIdx * BN + tileCol];
-
-            // Iterating through the TM results assigned to the current thread
-            for(int resIdx = 0; resIdx < TM; ++resIdx){
-                int baseRow = tileRow * TM;
-                int specificRow = baseRow + resIdx;
-
-                threadResults[resIdx] += A[specificRow * BK + kIdx] * B_reg; 
-            }
-
-            __syncthreads();
-        }
+  // outer-most loop over block tiles
+  for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
+    // populate the SMEM caches
+    for (uint loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
+      As[(innerRowA + loadOffset) * BK + innerColA] =
+          A[(innerRowA + loadOffset) * K + innerColA];
     }
-
-    for(int resIdx = 0; resIdx < TM; ++resIdx){
-
-        int specificRowC = tileRow * TM + resIdx;
-
-        if (cRow * BM + specificRowC < M && cCol * BN + threadCol < N){
-            C[specificRowC* BK + tileCol] = alpha * threadResults[resIdx] + beta * C[specificRowC * BK + tileCol];
-        }
-        
+    for (uint loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
+      Bs[(innerRowB + loadOffset) * BN + innerColB] =
+          B[(innerRowB + loadOffset) * N + innerColB];
     }
+    __syncthreads();
+
+    // advance blocktile
+    A += BK;     // move BK columns to right
+    B += BK * N; // move BK rows down
+
+    // calculate per-thread results
+    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+      // block into registers
+      for (uint i = 0; i < TM; ++i) {
+        regM[i] = As[(threadRow * TM + i) * BK + dotIdx];
+      }
+      for (uint i = 0; i < TN; ++i) {
+        regN[i] = Bs[dotIdx * BN + threadCol * TN + i];
+      }
+      for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+        for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+          threadResults[resIdxM * TN + resIdxN] +=
+              regM[resIdxM] * regN[resIdxN];
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // write out the results
+  for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+      C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN] =
+          alpha * threadResults[resIdxM * TN + resIdxN] +
+          beta * C[(threadRow * TM + resIdxM) * N + threadCol * TN + resIdxN];
+    }
+  }
 }
+
 
 void initialise_matrix(float * mat, int rows, int cols){
     std::random_device rd;
